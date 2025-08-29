@@ -1,7 +1,10 @@
-require('dotenv').config();
-const express = require('express');
-const bodyParser = require('body-parser');
-const { DataApi } = require('@proofgeist/fmdapi');
+import dotenv from 'dotenv';
+import express from 'express';
+import bodyParser from 'body-parser';
+import { DataApi } from '@proofgeist/fmdapi';
+import crypto from 'crypto';
+
+dotenv.config();
 
 const app = express();
 app.use(bodyParser.raw({ type: 'application/json' }));
@@ -46,7 +49,6 @@ function formatDuration(seconds) {
 
 // Zoom Webhook検証
 function verifyZoomWebhook(req) {
-    const crypto = require('crypto');
     const message = `v0:${req.headers['x-zm-request-timestamp']}:${req.body}`;
     const hashForVerify = crypto
         .createHmac('sha256', process.env.ZOOM_WEBHOOK_SECRET_TOKEN || 'temp')
@@ -68,7 +70,6 @@ app.get('/', (req, res) => {
 
 // Webhookエンドポイント
 app.post('/zoom-webhook', async (req, res) => {
-    const crypto = require('crypto');
     const body = JSON.parse(req.body);
 
     // CRC検証（初回設定時）
