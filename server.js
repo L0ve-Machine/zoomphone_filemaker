@@ -1,193 +1,24 @@
 require('dotenv').config();
 const express = require('express');
-const axios = require('axios');
-const crypto = require('crypto');
 const bodyParser = require('body-parser');
-const cron = require('node-cron');
+const { DataApi } = require('@proofgeist/fmdapi');
 
 const app = express();
 app.use(bodyParser.raw({ type: 'application/json' }));
 
-// FileMaker認証トークンの管理
-let fmToken = null;
-let tokenExpiryTime = null;
+// FileMaker Cloud接続設定
+const client = new DataApi({
+    server: process.env.FM_SERVER_URL,
+    database: process.env.FM_DATABASE,
+    auth: {
+        username: process.env.FM_USERNAME,
+        password: process.env.FM_PASSWORD,
+        type: 'FileMakerID' // Claris ID認証を使用
+    },
+    layout: process.env.FM_LAYOUT
+});
 
-// FileMakerクラス
-class FileMakerAPI {
-    constructor() {
-        this.baseURL = `${process.env.FM_SERVER_URL}/fmi/data/v2`;
-        this.database = process.env.FM_DATABASE;
-        this.layout = process.env.FM_LAYOUT;
-    }
-
-    async login() {
-        try {
-            console.log('Attempting FileMaker login...');
-            
-            const response = await axios.post(
-                `${this.baseURL}/databases/${this.database}/sessions`,
-                {},
-                {
-                    auth: {
-                        username: process.env.FM_USERNAME,
-                        password: process.env.FM_PASSWORD
-                    },
-                    headers: {
-                        'Content-Type': 'application/json'
-                    }
-                }
-            );
-
-            fmToken = response.headers['x-fm-data-access-token'];
-            tokenExpiryTime = Date.now() + (14 * 60 * 1000);
-            
-            console.log('FileMaker login successful');
-            return fmToken;
-        } catch (error) {
-            console.error('FileMaker login error:', error.response?.data || error.message);
-            throw error;
-        }
-    }
-
-    async ensureValidToken() {
-        if (!fmToken || Date.now() >= tokenExpiryTime) {
-            await this.login();
-        }
-        return fmToken;
-    }
-
-    async createRecord(fieldData) {
-        try {
-            await this.ensureValidToken();
-
-            const response = await axios.post(
-                `${this.baseURL}/databases/${this.database}/layouts/${this.layout}/records`,
-                {
-                    fieldData: fieldData,
-                    options: {
-                        entrymode: "user",
-                        prohibitmode: "user"
-                    }
-                },
-                {
-                    headers: {
-                        'Authorization': `Bearer ${fmToken}`,
-                        'Content-Type': 'application/json'
-                    }
-                }
-            );
-
-            console.log('Record created successfully:', response.data.response);
-            return response.data;
-        } catch (error) {
-            if (error.response?.status === 401) {
-                console.log('Token expired, re-authenticating...');
-                await this.login();
-                return this.createRecord(fieldData);
-            }
-            
-            console.error('FileMaker create record error:', error.response?.data || error.message);
-            throw error;
-        }
-    }
-
-    async findRecord(callId) {
-        try {
-            await this.ensureValidToken();
-
-            const response = await axios.post(
-                `${this.baseURL}/databases/${this.database}/layouts/${this.layout}/_find`,
-                {
-                    query: [{
-                        "call_id": callId
-                    }],
-                    limit: 1
-                },
-                {
-                    headers: {
-                        'Authorization': `Bearer ${fmToken}`,
-                        'Content-Type': 'application/json'
-                    }
-                }
-            );
-
-            return response.data.response.data;
-        } catch (error) {
-            if (error.response?.data?.messages?.[0]?.code === "401") {
-                return [];
-            }
-            throw error;
-        }
-    }
-
-    async updateRecord(recordId, fieldData, modId = null) {
-        try {
-            await this.ensureValidToken();
-
-            const requestBody = { fieldData };
-            if (modId) {
-                requestBody.modId = modId;
-            }
-
-            const response = await axios.patch(
-                `${this.baseURL}/databases/${this.database}/layouts/${this.layout}/records/${recordId}`,
-                requestBody,
-                {
-                    headers: {
-                        'Authorization': `Bearer ${fmToken}`,
-                        'Content-Type': 'application/json'
-                    }
-                }
-            );
-
-            console.log('Record updated successfully');
-            return response.data;
-        } catch (error) {
-            if (error.response?.status === 401) {
-                await this.login();
-                return this.updateRecord(recordId, fieldData, modId);
-            }
-            
-            console.error('FileMaker update record error:', error.response?.data || error.message);
-            throw error;
-        }
-    }
-
-    async logout() {
-        if (!fmToken) return;
-
-        try {
-            await axios.delete(
-                `${this.baseURL}/databases/${this.database}/sessions/${fmToken}`,
-                {
-                    headers: {
-                        'Content-Type': 'application/json'
-                    }
-                }
-            );
-            
-            fmToken = null;
-            tokenExpiryTime = null;
-            console.log('FileMaker logout successful');
-        } catch (error) {
-            console.error('FileMaker logout error:', error.message);
-        }
-    }
-}
-
-const fm = new FileMakerAPI();
-
-function verifyZoomWebhook(req) {
-    const message = `v0:${req.headers['x-zm-request-timestamp']}:${req.body}`;
-    const hashForVerify = crypto
-        .createHmac('sha256', process.env.ZOOM_WEBHOOK_SECRET_TOKEN)
-        .update(message)
-        .digest('hex');
-    const signature = `v0=${hashForVerify}`;
-    
-    return signature === req.headers['x-zm-signature'];
-}
-
+// タイムスタンプ変換
 function formatTimestamp(timestamp) {
     if (!timestamp) return '';
     
@@ -202,6 +33,7 @@ function formatTimestamp(timestamp) {
     return `${month}/${day}/${year} ${hours}:${minutes}:${seconds}`;
 }
 
+// 通話時間フォーマット
 function formatDuration(seconds) {
     if (!seconds) return '00:00:00';
     
@@ -210,6 +42,19 @@ function formatDuration(seconds) {
     const secs = seconds % 60;
     
     return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+}
+
+// Zoom Webhook検証
+function verifyZoomWebhook(req) {
+    const crypto = require('crypto');
+    const message = `v0:${req.headers['x-zm-request-timestamp']}:${req.body}`;
+    const hashForVerify = crypto
+        .createHmac('sha256', process.env.ZOOM_WEBHOOK_SECRET_TOKEN || 'temp')
+        .update(message)
+        .digest('hex');
+    const signature = `v0=${hashForVerify}`;
+    
+    return signature === req.headers['x-zm-signature'];
 }
 
 // ルートエンドポイント
@@ -223,12 +68,13 @@ app.get('/', (req, res) => {
 
 // Webhookエンドポイント
 app.post('/zoom-webhook', async (req, res) => {
+    const crypto = require('crypto');
     const body = JSON.parse(req.body);
 
     // CRC検証（初回設定時）
     if (body.event === 'endpoint.url_validation') {
         const hashForPlainToken = crypto
-            .createHmac('sha256', process.env.ZOOM_WEBHOOK_SECRET_TOKEN)
+            .createHmac('sha256', process.env.ZOOM_WEBHOOK_SECRET_TOKEN || 'temp')
             .update(body.payload.plainToken)
             .digest('hex');
 
@@ -251,30 +97,33 @@ app.post('/zoom-webhook', async (req, res) => {
         console.log(`Processing event: ${event}`);
 
         let recordData = {};
-        let shouldUpdate = false;
-        let existingRecord = null;
 
+        // イベントタイプごとの処理
         switch (event) {
             case 'phone.call_log_created':
             case 'phone.caller_call_log_completed':
             case 'phone.callee_call_log_completed':
                 const callId = payload.call_id || payload.id;
-                if (callId) {
-                    const records = await fm.findRecord(callId);
-                    if (records.length > 0) {
-                        existingRecord = records[0];
-                        shouldUpdate = true;
+                
+                // 既存レコード検索
+                try {
+                    const existingRecords = await client.find({
+                        query: [{ call_id: callId }]
+                    });
+                    
+                    if (existingRecords.data && existingRecords.data.length > 0) {
+                        console.log(`Record already exists for call_id: ${callId}`);
+                        return res.status(200).send('OK - Record exists');
                     }
+                } catch (err) {
+                    // レコードが見つからない場合は新規作成
                 }
 
                 recordData = {
-                    // 新規追加フィールド
                     call_id: callId,
                     call_duration_seconds: payload.duration || 0,
                     call_direction: payload.direction || '',
                     call_end_time: formatTimestamp(payload.end_time),
-                    
-                    // 既存フィールドへのマッピング
                     電話番号: payload.caller_number || payload.callee_number || '',
                     対応日時: formatTimestamp(payload.start_time || payload.date_time),
                     状態: '未対応'
@@ -283,31 +132,28 @@ app.post('/zoom-webhook', async (req, res) => {
 
             case 'phone.callee_missed':
                 recordData = {
-                    // 新規追加フィールド
                     call_id: payload.call_id || payload.id,
                     call_duration_seconds: 0,
                     call_direction: 'inbound',
-                    call_end_time: formatTimestamp(payload.date_time),
-                    
-                    // 既存フィールドへのマッピング
                     電話番号: payload.caller_number || '',
                     対応日時: formatTimestamp(payload.date_time),
                     状態: '未対応'
                 };
                 break;
+
+            default:
+                console.log(`Unhandled event type: ${event}`);
+                return res.status(200).send('OK - Event not processed');
         }
 
+        // FileMakerにレコード作成
         if (Object.keys(recordData).length > 0) {
-            if (shouldUpdate && existingRecord) {
-                await fm.updateRecord(
-                    existingRecord.recordId,
-                    recordData,
-                    existingRecord.modId
-                );
-                console.log(`Record updated for call_id: ${recordData.call_id || 'unknown'}`);
-            } else {
-                await fm.createRecord(recordData);
+            try {
+                await client.create(recordData);
                 console.log(`Record created for call_id: ${recordData.call_id || 'unknown'}`);
+            } catch (error) {
+                console.error('FileMaker create error:', error.message);
+                // エラーが発生してもWebhookは成功として返す
             }
         }
 
@@ -321,11 +167,13 @@ app.post('/zoom-webhook', async (req, res) => {
 // ヘルスチェック
 app.get('/health', async (req, res) => {
     try {
-        await fm.ensureValidToken();
+        // FileMaker接続テスト
+        const layouts = await client.layouts();
         res.json({ 
             status: 'healthy',
             timestamp: new Date().toISOString(),
-            filemakerConnected: !!fmToken
+            filemakerConnected: true,
+            availableLayouts: layouts
         });
     } catch (error) {
         res.status(503).json({ 
@@ -335,34 +183,19 @@ app.get('/health', async (req, res) => {
     }
 });
 
-// トークンの定期更新（13分ごと）
-cron.schedule('*/13 * * * *', async () => {
-    console.log('Refreshing FileMaker token...');
-    try {
-        await fm.login();
-    } catch (error) {
-        console.error('Token refresh failed:', error.message);
-    }
-});
-
-// グレースフルシャットダウン
-process.on('SIGTERM', async () => {
-    console.log('SIGTERM signal received: closing HTTP server');
-    await fm.logout();
-    process.exit(0);
-});
-
 // サーバー起動
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
     console.log(`Server running on port ${PORT}`);
     console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
     
-    // 起動時にFileMakerにログイン
+    // 起動時の接続テスト
     try {
-        await fm.login();
-        console.log('Initial FileMaker connection established');
+        const layouts = await client.layouts();
+        console.log('FileMaker Cloud connection established');
+        console.log('Available layouts:', layouts);
     } catch (error) {
         console.error('Initial FileMaker connection failed:', error.message);
+        console.error('Make sure 2FA is disabled for the API account');
     }
 });
