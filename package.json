@@ -7,7 +7,7 @@
     "start": "node server.js"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18.0.0 <20.0.0"
   },
   "dependencies": {
     "@proofgeist/fmdapi": "^3.5.0",
